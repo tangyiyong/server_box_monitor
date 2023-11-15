@@ -1,78 +1,129 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/lollipopkit/gommon/term"
-	"github.com/lollipopkit/gommon/util"
+	"github.com/lollipopkit/gommon/log"
+	"github.com/lollipopkit/gommon/rate"
+	"github.com/lollipopkit/gommon/sys"
 	"github.com/lollipopkit/server_box_monitor/res"
 )
 
 var (
-	Config = &AppConfig{}
+	Config        = new(AppConfig)
+	CheckInterval time.Duration
+	RateLimiter   *rate.RateLimiter[string]
 )
 
 type AppConfig struct {
 	Version int `json:"version"`
-	// Such as "30s" or "5m".
-	// Valid time units are "s", "m", "h".
-	// Values less than 10 seconds are not allowed.
+	// Such as "7s".
+	// Valid time units are "s".
+	// Values bigger than 10 seconds are not allowed.
 	Interval string `json:"interval"`
+	Rate     string `json:"rate"`
+	Name     string `json:"name"`
 	Rules    []Rule `json:"rules"`
 	Pushes   []Push `json:"pushes"`
 }
 
+func InitConfig() error {
+	buf := new(bytes.Buffer)
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "\t")
+	err := enc.Encode(DefaultAppConfig)
+	if err != nil {
+		log.Err("[CONFIG] marshal default app config failed: %v", err)
+		return err
+	}
+	err = os.WriteFile(res.AppConfigPath, buf.Bytes(), 0644)
+	if err != nil {
+		log.Err("[CONFIG] write default app config failed: %v", err)
+		return err
+	}
+	Config = DefaultAppConfig
+	return nil
+}
+
 func ReadAppConfig() error {
-	if !util.Exist(res.AppConfigPath) {
-		configBytes, err := json.MarshalIndent(DefaultappConfig, "", "\t")
-		if err != nil {
-			term.Err("[CONFIG] marshal default app config failed: %v", err)
-			return err
-		}
-		err = os.WriteFile(res.AppConfigPath, configBytes, 0644)
-		if err != nil {
-			term.Err("[CONFIG] write default app config failed: %v", err)
-			return err
-		}
-		Config = DefaultappConfig
-		return nil
+	defer initInterval()
+	defer initRateLimiter()
+	if !sys.Exist(res.AppConfigPath) {
+		return InitConfig()
 	}
 
 	configBytes, err := os.ReadFile(res.AppConfigPath)
 	if err != nil {
-		term.Err("[CONFIG] read app config failed: %v", err)
+		log.Err("[CONFIG] read app config failed: %v", err)
 		return err
 	}
 	err = json.Unmarshal(configBytes, Config)
 	if err != nil {
-		term.Err("[CONFIG] unmarshal app config failed: %v", err)
-	} else if Config.Version < DefaultappConfig.Version {
-		term.Warn("[CONFIG] app config version is too old, please update it")
+		log.Err("[CONFIG] unmarshal app config failed: %v", err)
+	} else if Config.Version < DefaultAppConfig.Version {
+		log.Warn("[CONFIG] app config version is too old, new config will be generated")
+		// Backup old config
+		err = os.WriteFile(res.AppConfigPath+".bak", configBytes, 0644)
+		if err != nil {
+			log.Err("[CONFIG] backup old config failed: %v", err)
+			return err
+		}
+		// Generate new config
+		configBytes, err := json.MarshalIndent(DefaultAppConfig, "", "\t")
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile(res.AppConfigPath, configBytes, 0644)
+		if err != nil {
+			panic(err)
+		}
+		log.Info("[CONFIG] new config generated, edit it and restart the program")
+		os.Exit(0)
 	}
 	return err
 }
 
-func GetInterval() time.Duration {
-	ac := DefaultappConfig
-	if Config != nil {
-		ac = Config
-	}
-	d, err := time.ParseDuration(ac.Interval)
+func initInterval() {
+	d, err := time.ParseDuration(Config.Interval)
 	if err == nil {
-		if d < res.DefaultInterval {
-			term.Warn("[CONFIG] interval is too short, use default interval: 1m")
-			return res.DefaultInterval
+		if d > res.MaxInterval || d < time.Second {
+			log.Warn("[CONFIG] use default interval")
+			CheckInterval = res.DefaultInterval
+			return
 		}
-		return d
+		CheckInterval = d
+		return
 	}
-	term.Warn("[CONFIG] parse interval failed: %v, use default interval: 1m", err)
-	return res.DefaultInterval
+	log.Warn("[CONFIG] parse interval failed: %v", err)
+	CheckInterval = res.DefaultInterval
 }
 
-func GetIntervalInSeconds() float64 {
-	return GetInterval().Seconds()
+func initRateLimiter() {
+	splited := strings.Split(Config.Rate, "/")
+	if len(splited) != 2 {
+		log.Warn("[CONFIG] parse rate failed")
+		RateLimiter = res.DefaultRateLimiter
+		return
+	}
+	times, err := strconv.Atoi(splited[0])
+	if err != nil {
+		log.Warn("[CONFIG] parse rate failed: %v", err)
+		RateLimiter = res.DefaultRateLimiter
+		return
+	}
+	duration, err := time.ParseDuration(splited[1])
+	if err != nil {
+		log.Warn("[CONFIG] parse rate failed: %v", err)
+		RateLimiter = res.DefaultRateLimiter
+		return
+	}
+	RateLimiter = rate.NewLimiter[string](duration, times)
 }
 
 var (
@@ -80,7 +131,9 @@ var (
 		"action": "send_group_msg",
 		"params": map[string]interface{}{
 			"group_id": 123456789,
-			"message":  "ServerBox Notification\n{{key}}: {{value}}",
+			"message": res.PushFormatNameLocator +
+				"\n" +
+				res.PushFormatMsgLocator,
 		},
 	}
 	defaultWekhookBodyBytes, _ = json.Marshal(defaultWebhookBody)
@@ -90,61 +143,30 @@ var (
 			"Content-Type":  "application/json",
 			"Authorization": "Bearer YOUR_SECRET",
 		},
-		Method: "POST",
-		Body:   defaultWekhookBodyBytes,
+		Method:    "POST",
+		Body:      defaultWekhookBodyBytes,
 		BodyRegex: ".*",
 		Code:      200,
 	}
 	defaultWebhookIfaceBytes, _ = json.Marshal(defaultWebhookIface)
 
-	defaultIOSIface = PushIfaceIOS{
-		Token:   "YOUR_TOKEN",
-		Title:   "Server Notification",
-		Content: "{{key}}: {{value}}",
-		BodyRegex: ".*",
-		Code:      200,
-	}
-	defaultIOSIfaceBytes, _ = json.Marshal(defaultIOSIface)
-
-	defaultServerChanIface = PushIfaceServerChan{
-		SCKey: "YOUR_SCKEY",
-		Title: "Server Notification",
-		Desp:  "{{key}}: {{value}}",
-		BodyRegex: ".*",
-		Code:      200,
-	}
-	defaultServerChanIfaceBytes, _ = json.Marshal(defaultServerChanIface)
-
-	DefaultappConfig = &AppConfig{
-		Version:  1,
-		Interval: "30s",
+	DefaultAppConfig = &AppConfig{
+		Version:  res.ConfVersion,
+		Interval: res.DefaultIntervalStr,
+		Rate:     res.DefaultRateStr,
+		Name:     res.DefaultSeverName,
 		Rules: []Rule{
 			{
 				MonitorType: MonitorTypeCPU,
-				Threshold:   ">=77%",
-				Matcher:     "0",
-			},
-			{
-				MonitorType: MonitorTypeNetwork,
-				Threshold:   ">=7.7m/s",
-				Matcher:     "eth0",
+				Threshold:   `>=77%`,
+				Matcher:     "cpu",
 			},
 		},
 		Pushes: []Push{
 			{
-				Type:      PushTypeWebhook,
-				Name:      "QQ Group",
-				Iface:     defaultWebhookIfaceBytes,
-			},
-			{
-				Type:      PushTypeIOS,
-				Name:      "My iPhone",
-				Iface:     defaultIOSIfaceBytes,
-			},
-			{
-				Type:      PushTypeServerChan,
-				Name:      "ServerChan",
-				Iface:     defaultServerChanIfaceBytes,
+				Type:  PushTypeWebhook,
+				Name:  "QQ Group",
+				Iface: defaultWebhookIfaceBytes,
 			},
 		},
 	}

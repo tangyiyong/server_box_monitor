@@ -6,57 +6,59 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lollipopkit/gommon/term"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/lollipopkit/gommon/log"
 	"github.com/lollipopkit/server_box_monitor/model"
 	"github.com/lollipopkit/server_box_monitor/res"
+	"github.com/lollipopkit/server_box_monitor/web"
 )
 
 var (
 	pushPairs     = []*model.PushPair{}
 	pushPairsLock = new(sync.RWMutex)
-	lastPushTime time.Time
-	checkInterval = time.Second * 3
 )
 
 func init() {
 	scriptBytes, err := res.Files.ReadFile(res.ServerBoxShellFileName)
 	if err != nil {
-		term.Err("[INIT] Read embed file error: %v", err)
+		log.Err("[INIT] Read embed file error: %v", err)
 		panic(err)
 	}
 	err = os.WriteFile(res.ServerBoxShellPath, scriptBytes, 0755)
 	if err != nil {
-		term.Err("[INIT] Write script file error: %v", err)
+		log.Err("[INIT] Write script file error: %v", err)
 		panic(err)
 	}
 }
 
-func Start() {
-	go run()
+func Start(wc *model.WebConfig) {
+	go runWeb(wc)
+	go runCheck()
 	// 阻塞主线程
 	select {}
 }
 
-func run() {
+func runCheck() {
 	err := model.ReadAppConfig()
 	if err != nil {
-		term.Err("[CONFIG] Read app config error: %v", err)
+		log.Err("[CONFIG] Read app config error: %v", err)
 		panic(err)
 	}
 
-	for range time.NewTicker(checkInterval).C {
+	for range time.NewTicker(model.CheckInterval).C {
 		err = model.RefreshStatus()
 		status := model.Status
 		if err != nil {
-			term.Warn("[STATUS] Get status error: %v", err)
+			log.Warn("[STATUS] Get status error: %v", err)
 			continue
 		}
 
 		for _, rule := range model.Config.Rules {
 			notify, pushPair, err := rule.ShouldNotify(status)
 			if err != nil {
-				if !strings.Contains(err.Error(), "not ready") {
-					term.Warn("[RULE] %s error: %v", rule.Id(), err)
+				if !strings.Contains(err.Error(), model.ErrNotReady.Error()) {
+					log.Warn("[RULE] %s error: %v", rule.Id(), err)
 				}
 			}
 
@@ -70,26 +72,50 @@ func run() {
 		if len(pushPairs) == 0 {
 			continue
 		}
-		
-		if time.Now().Sub(lastPushTime) < model.GetInterval() {
-			continue
-		}
 
-		term.Info("[PUSH] %d to push", len(pushPairs))
+		log.Info("[PUSH] %d to push", len(pushPairs))
 
-		pushPairsLock.RLock()
 		for _, push := range model.Config.Pushes {
-			err := push.Push(pushPairs)
-			if err != nil {
-				term.Warn("[PUSH] %s error: %v", push.Name, err)
+			if !model.RateLimiter.Check(push.Name) {
+				log.Warn("[PUSH] %s rate limit reached", push.Name)
 				continue
 			}
-			term.Suc("[PUSH] %s success", push.Name)
+			pushPairsLock.RLock()
+			err := push.Push(pushPairs)
+			pushPairsLock.RUnlock()
+			if err != nil {
+				log.Warn("[PUSH] %s error: %v", push.Name, err)
+				continue
+			}
+			// 仅推送成功才计数
+			model.RateLimiter.Acquire(push.Name)
+			log.Suc("[PUSH] %s success", push.Name)
+
 		}
-		pushPairsLock.RUnlock()
 
 		pushPairsLock.Lock()
-		pushPairs = []*model.PushPair{}
+		pushPairs = pushPairs[:0]
 		pushPairsLock.Unlock()
 	}
+}
+
+func runWeb(wc *model.WebConfig) {
+	e := echo.New()
+
+	e.Use(middleware.Recover())
+	e.Use(middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(3)))
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{},
+	}))
+	e.HideBanner = true
+
+	e.GET("/status", web.Status)
+
+	var i any
+	if wc.HaveTLS() {
+		i = e.StartTLS(wc.Addr, wc.Cert, wc.Key)
+	} else {
+		i = e.Start(wc.Addr)
+	}
+	e.Logger.Fatal(i)
 }

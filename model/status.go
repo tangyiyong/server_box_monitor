@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/lollipopkit/gommon/term"
-	"github.com/lollipopkit/gommon/util"
+	"github.com/lollipopkit/gommon/log"
+	"github.com/lollipopkit/gommon/sys"
 	"github.com/lollipopkit/server_box_monitor/res"
 )
 
@@ -86,31 +87,84 @@ type networkOneTimeStatus struct {
 	Transmit Size
 	Receive  Size
 }
+
+type networkIface interface {
+	TransmitSpeed() (Size, error)
+	ReceiveSpeed() (Size, error)
+	Transmit() Size
+	Receive() Size
+}
+
 type networkStatus struct {
 	Interface string
 	TimeSequence[networkOneTimeStatus]
 }
 
-func (ns *networkStatus) TransmitSpeed() (Size, error) {
+func (ns networkStatus) TransmitSpeed() (Size, error) {
 	if ns.TimeSequence.New == nil || ns.TimeSequence.Old == nil {
 		return 0, ErrNotReady
 	}
 	diff := float64(ns.TimeSequence.New.Transmit - ns.TimeSequence.Old.Transmit)
-	return Size(diff / GetIntervalInSeconds()), nil
+	return Size(diff / CheckInterval.Seconds()), nil
 }
-func (ns *networkStatus) ReceiveSpeed() (Size, error) {
+func (ns networkStatus) ReceiveSpeed() (Size, error) {
 	if ns.TimeSequence.New == nil || ns.TimeSequence.Old == nil {
 		return 0, ErrNotReady
 	}
 	diff := float64(ns.TimeSequence.New.Receive - ns.TimeSequence.Old.Receive)
-	return Size(diff / GetIntervalInSeconds()), nil
+	return Size(diff / CheckInterval.Seconds()), nil
+}
+func (ns networkStatus) Transmit() Size {
+	return ns.TimeSequence.New.Transmit
+}
+func (ns networkStatus) Receive() Size {
+	return ns.TimeSequence.New.Receive
+}
+
+type AllNetworkStatus []networkStatus
+
+func (nss AllNetworkStatus) TransmitSpeed() (Size, error) {
+	var sum float64
+	for _, ns := range nss {
+		speed, err := ns.TransmitSpeed()
+		if err != nil {
+			return 0, err
+		}
+		sum += float64(speed)
+	}
+	return Size(sum), nil
+}
+func (nss AllNetworkStatus) ReceiveSpeed() (Size, error) {
+	var sum float64
+	for _, ns := range nss {
+		speed, err := ns.ReceiveSpeed()
+		if err != nil {
+			return 0, err
+		}
+		sum += float64(speed)
+	}
+	return Size(sum), nil
+}
+func (nss AllNetworkStatus) Transmit() Size {
+	var sum float64
+	for _, ns := range nss {
+		sum += float64(ns.Transmit())
+	}
+	return Size(sum)
+}
+func (nss AllNetworkStatus) Receive() Size {
+	var sum float64
+	for _, ns := range nss {
+		sum += float64(ns.Receive())
+	}
+	return Size(sum)
 }
 
 func RefreshStatus() error {
-	output, _ := util.Execute("bash", res.ServerBoxShellPath)
+	output, _ := sys.Execute("sh", res.ServerBoxShellPath)
 	err := os.WriteFile(filepath.Join(res.ServerBoxDirPath, "shell_output.log"), []byte(output), 0644)
 	if err != nil {
-		term.Warn("[STATUS] write shell output log failed: %s", err)
+		log.Warn("[STATUS] write shell output log failed: %s", err)
 	}
 	return ParseStatus(output)
 }
@@ -121,28 +175,28 @@ func ParseStatus(s string) error {
 		segments[i] = strings.TrimSpace(segments[i])
 		segments[i] = strings.Trim(segments[i], "\n")
 	}
-	if len(segments) != 10 {
-		return ErrInvalidShellOutput
+	if len(segments) != 7 {
+		return errors.Join(ErrInvalidShellOutput, fmt.Errorf("expect 7 segments, but got %d", len(segments)))
 	}
-	err := parseNetworkStatus(segments[1])
+	err := ParseNetworkStatus(segments[1])
 	if err != nil {
-		term.Warn("parse network status failed: %s", err)
+		log.Warn("parse network status failed: %s", err)
 	}
-	err = parseCPUStatus(segments[2])
+	err = ParseCPUStatus(segments[2])
 	if err != nil {
-		term.Warn("parse cpu status failed: %s", err)
+		log.Warn("parse cpu status failed: %s", err)
 	}
-	err = parseDiskStatus(segments[3])
+	err = ParseDiskStatus(segments[3])
 	if err != nil {
-		term.Warn("parse disk status failed: %s", err)
+		log.Warn("parse disk status failed: %s", err)
 	}
-	err = parseMemAndSwapStatus(segments[4])
+	err = ParseMemAndSwapStatus(segments[4])
 	if err != nil {
-		term.Warn("parse mem status failed: %s", err)
+		log.Warn("parse mem status failed: %s", err)
 	}
-	err = parseTemperatureStatus(segments[5], segments[6])
+	err = ParseTemperatureStatus(segments[5], segments[6])
 	if err != nil {
-		term.Warn("parse temperature status failed: %s", err)
+		log.Warn("parse temperature status failed: %s", err)
 	}
 	return nil
 }
@@ -158,7 +212,7 @@ func initSwap() {
 	}
 }
 
-func parseMemAndSwapStatus(s string) error {
+func ParseMemAndSwapStatus(s string) error {
 	initMem()
 	initSwap()
 	lines := strings.Split(s, "\n")
@@ -176,28 +230,23 @@ func parseMemAndSwapStatus(s string) error {
 		switch true {
 		case strings.HasPrefix(line, "MemTotal:"):
 			Status.Mem.Total = size
-			fallthrough
 		case strings.HasPrefix(line, "MemFree:"):
 			Status.Mem.Free = size
-			Status.Mem.Used = Status.Mem.Total - Status.Mem.Free
-			fallthrough
 		case strings.HasPrefix(line, "MemAvailable:"):
 			Status.Mem.Avail = size
 		case strings.HasPrefix(line, "SwapTotal:"):
 			Status.Swap.Total = size
-			fallthrough
 		case strings.HasPrefix(line, "SwapFree:"):
 			Status.Swap.Free = size
-			Status.Swap.Used = Status.Swap.Total - Status.Swap.Free
-			fallthrough
 		case strings.HasPrefix(line, "SwapCached:"):
-			Status.Swap.Cached = size
+			Status.Swap.Used = size
 		}
 	}
+	Status.Mem.Used = Status.Mem.Total - Status.Mem.Avail
 	return nil
 }
 
-func parseCPUStatus(s string) error {
+func ParseCPUStatus(s string) error {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	count := len(lines)
 	if len(Status.CPU) != count {
@@ -210,16 +259,12 @@ func parseCPUStatus(s string) error {
 			if len(fields) != 11 {
 				return errors.Join(ErrInvalidShellOutput, fmt.Errorf("invalid cpu status: %s", line))
 			}
-			user, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return err
-			}
-			sys, err := strconv.Atoi(fields[2])
+			idle, err := strconv.Atoi(fields[4])
 			if err != nil {
 				return err
 			}
 			total := 0
-			for i := 2; i < 11; i++ {
+			for i := 1; i < 8; i++ {
 				v, err := strconv.Atoi(fields[i])
 				if err != nil {
 					return err
@@ -227,7 +272,7 @@ func parseCPUStatus(s string) error {
 				total += v
 			}
 			Status.CPU[i].TimeSequence.Update(&cpuOneTimeStatus{
-				Used:  user + sys,
+				Used:  total - idle,
 				Total: total,
 			})
 		}
@@ -235,42 +280,51 @@ func parseCPUStatus(s string) error {
 	return nil
 }
 
-func parseDiskStatus(s string) error {
+func ParseDiskStatus(s string) error {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	lines = lines[1:]
 	count := len(lines)
 	if len(Status.Disk) != count {
 		Status.Disk = make([]diskStatus, count)
 	}
+	failIdx := sort.IntSlice{}
 	for i := range lines {
 		line := strings.TrimSpace(lines[i])
 		fields := strings.Fields(line)
 		if len(fields) != 6 {
-			return errors.Join(ErrInvalidShellOutput, fmt.Errorf("invalid disk status: %s", line))
+			failIdx = append(failIdx, i)
+			continue
 		}
 		Status.Disk[i].MountPath = fields[5]
 		Status.Disk[i].Filesystem = fields[0]
 		total, err := ParseToSize(fields[1])
 		if err != nil {
-			return err
+			failIdx = append(failIdx, i)
+			continue
 		}
 		Status.Disk[i].Total = total
 		used, err := ParseToSize(fields[2])
 		if err != nil {
-			return err
+			failIdx = append(failIdx, i)
+			continue
 		}
 		Status.Disk[i].Used = used
 		avail, err := ParseToSize(fields[3])
 		if err != nil {
-			return err
+			failIdx = append(failIdx, i)
+			continue
 		}
 		Status.Disk[i].Avail = avail
 		Status.Disk[i].UsedPercent = (float64(used) / float64(total)) * 100
 	}
+	sort.Sort(sort.Reverse(failIdx))
+	for _, idx := range failIdx {
+		Status.Disk = append(Status.Disk[:idx], Status.Disk[idx+1:]...)
+	}
 	return nil
 }
 
-func parseTemperatureStatus(s1, s2 string) error {
+func ParseTemperatureStatus(s1, s2 string) error {
 	if strings.Contains(s1, "/sys/class/thermal/thermal_zone*/type") {
 		return nil
 	}
@@ -294,7 +348,7 @@ func parseTemperatureStatus(s1, s2 string) error {
 	return nil
 }
 
-func parseNetworkStatus(s string) error {
+func ParseNetworkStatus(s string) error {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	count := len(lines)
 	if len(Status.Network) != count-2 {

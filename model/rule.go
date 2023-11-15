@@ -31,7 +31,7 @@ type Rule struct {
 }
 
 func (r *Rule) Id() string {
-	return fmt.Sprintf("[%s %s %s]", r.MonitorType, r.Threshold, r.Matcher)
+	return fmt.Sprintf("Rule(%s %s %s)", r.MonitorType, r.Threshold, r.Matcher)
 }
 func (r *Rule) ShouldNotify(s *serverStatus) (bool, *PushPair, error) {
 	t, err := ParseToThreshold(r.Threshold)
@@ -96,10 +96,10 @@ func (r *Rule) shouldNotifyCPU(ss []oneCpuStatus, t *Threshold) (bool, *PushPair
 		if idx > 0 {
 			key = fmt.Sprintf("cpu%d", idx-1)
 		}
-		return ok, &PushPair{
-			Key:   key,
-			Value: fmt.Sprintf("%.2f%%", usedPercent),
-		}, nil
+		return ok, NewPushPair(
+			key,
+			fmt.Sprintf("%.2f%%", usedPercent),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for cpu: %s", t.ThresholdType.Name()))
 	}
@@ -125,25 +125,28 @@ func (r *Rule) shouldNotifyMemory(s *memStatus, t *Threshold) (bool, *PushPair, 
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid matcher: %s", r.Matcher))
 	}
 
+	// 使用百分比来对比
+	percent *= 100
+
 	switch t.ThresholdType {
 	case ThresholdTypeSize:
 		ok, err := t.True(size)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher + "of Memory",
-			Value: size.String(),
-		}, nil
+		return ok, NewPushPair(
+			"Mem "+r.Matcher,
+			size.String(),
+		), nil
 	case ThresholdTypePercent:
 		ok, err := t.True(percent)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher + "of Memory",
-			Value: fmt.Sprintf("%.2f%%", percent*100),
-		}, nil
+		return ok, NewPushPair(
+			"Mem "+r.Matcher,
+			fmt.Sprintf("%.2f%%", percent),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for memory: %s", t.ThresholdType.Name()))
 	}
@@ -166,25 +169,28 @@ func (r *Rule) shouldNotifySwap(s *swapStatus, t *Threshold) (bool, *PushPair, e
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid matcher: %s", r.Matcher))
 	}
 
+	// 使用百分比来对比
+	percent *= 100
+
 	switch t.ThresholdType {
 	case ThresholdTypeSize:
 		ok, err := t.True(size)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher + "of Swap",
-			Value: size.String(),
-		}, nil
+		return ok, NewPushPair(
+			"Swap "+r.Matcher,
+			size.String(),
+		), nil
 	case ThresholdTypePercent:
 		ok, err := t.True(percent)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher + "of Swap",
-			Value: fmt.Sprintf("%.2f%%", percent*100),
-		}, nil
+		return ok, NewPushPair(
+			"Swap "+r.Matcher,
+			fmt.Sprintf("%.2f%%", percent),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for swap: %s", t.ThresholdType.Name()))
 	}
@@ -213,40 +219,44 @@ func (r *Rule) shouldNotifyDisk(s []diskStatus, t *Threshold) (bool, *PushPair, 
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher,
-			Value: disk.Used.String(),
-		}, nil
+		return ok, NewPushPair(
+			r.Matcher,
+			disk.Used.String(),
+		), nil
 	case ThresholdTypePercent:
 		ok, err := t.True(disk.UsedPercent)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher,
-			Value: fmt.Sprintf("%.2f%%", disk.UsedPercent),
-		}, nil
+		return ok, NewPushPair(
+			r.Matcher,
+			fmt.Sprintf("%.2f%%", disk.UsedPercent),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for disk: %s", t.ThresholdType.Name()))
 	}
 }
 func (r *Rule) shouldNotifyNetwork(s []networkStatus, t *Threshold) (bool, *PushPair, error) {
 	if len(s) == 0 {
-		// utils.Warn("network is not valid, skip this rule")
 		return false, nil, nil
 	}
 
-	var net networkStatus
-	var have bool
-	for _, n := range s {
-		if strings.Contains(r.Matcher, n.Interface) {
-			net = n
-			have = true
-			break
+	var net networkIface
+	// 如果 matcher 为空，则默认计算所有网卡
+	if len(s) == 0 {
+		net = AllNetworkStatus(Status.Network)
+	} else {
+		var have bool
+		for _, n := range s {
+			if strings.Contains(r.Matcher, n.Interface) {
+				net = n
+				have = true
+				break
+			}
 		}
-	}
-	if !have {
-		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("network interface not found: %s", r.Matcher))
+		if !have {
+			return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("network interface not found: %s", r.Matcher))
+		}
 	}
 
 	// 判断是否计算出/入流量
@@ -279,26 +289,26 @@ func (r *Rule) shouldNotifyNetwork(s []networkStatus, t *Threshold) (bool, *Push
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher,
-			Value: speed.String(),
-		}, nil
+		return ok, NewPushPair(
+			r.Matcher,
+			speed.String()+"/s",
+		), nil
 	case ThresholdTypeSize:
 		size := Size(0)
 		if in {
-			size += net.TimeSequence.New.Receive
+			size += net.Receive()
 		}
 		if out {
-			size += net.TimeSequence.New.Transmit
+			size += net.Transmit()
 		}
 		ok, err := t.True(size)
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher,
-			Value: size.String(),
-		}, nil
+		return ok, NewPushPair(
+			r.Matcher,
+			size.String(),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for network: %s", t.ThresholdType.Name()))
 	}
@@ -329,10 +339,10 @@ func (r *Rule) shouldNotifyTemperature(s []temperatureStatus, t *Threshold) (boo
 		if err != nil {
 			return false, nil, err
 		}
-		return ok, &PushPair{
-			Key:   r.Matcher,
-			Value: fmt.Sprintf("%.2f°C", temp.Value),
-		}, nil
+		return ok, NewPushPair(
+			r.Matcher,
+			fmt.Sprintf("%.2f°C", temp.Value),
+		), nil
 	default:
 		return false, nil, errors.Join(ErrInvalidRule, fmt.Errorf("invalid threshold type for temperature: %s", t.ThresholdType.Name()))
 	}
